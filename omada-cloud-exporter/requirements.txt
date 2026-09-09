@@ -1,0 +1,4 @@
+flask
+requests
+prometheus-client
+playwright==1.62.0
