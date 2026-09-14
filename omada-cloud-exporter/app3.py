@@ -998,6 +998,91 @@ def get_active_ssids():
     )
 
 
+# Per-client metrics from the Omada OpenAPI /clients endpoint.
+# Identity/context labels are kept limited to avoid unnecessary cardinality.
+client_up = Gauge(
+    "omada_client_up",
+    "Current active Omada client. 1=active",
+    ["client_mac", "client_name", "ap_mac", "ap_name", "ssid", "band", "channel", "os", "vendor"]
+)
+
+# Snapshot metric intended for a single Grafana Client Details table.
+# NOTE: Dynamic client values are labels here for dashboard convenience.
+# This is acceptable for the current small deployment, but should not be
+# used as a high-cardinality pattern for a large fleet.
+client_details = Gauge(
+    "omada_client_details",
+    "Complete current Omada client details for Grafana table",
+    [
+        "client_mac",
+        "client_name",
+        "ap_mac",
+        "ap_name",
+        "ssid",
+        "band",
+        "channel",
+        "ip",
+        "os",
+        "vendor",
+        "rssi",
+        "signal",
+        "snr",
+        "rx_rate",
+        "tx_rate",
+        "download",
+        "upload",
+        "uptime",
+    ]
+)
+
+client_rssi = Gauge(
+    "omada_client_rssi_dbm",
+    "Client RSSI in dBm",
+    ["client_mac", "ap_mac"]
+)
+
+client_signal_level = Gauge(
+    "omada_client_signal_level_percent",
+    "Client signal level percentage",
+    ["client_mac", "ap_mac"]
+)
+
+client_snr = Gauge(
+    "omada_client_snr_db",
+    "Client SNR in dB",
+    ["client_mac", "ap_mac"]
+)
+
+client_rx_rate = Gauge(
+    "omada_client_rx_rate_bits_per_second",
+    "Client RX rate in bits per second",
+    ["client_mac", "ap_mac"]
+)
+
+client_tx_rate = Gauge(
+    "omada_client_tx_rate_bits_per_second",
+    "Client TX rate in bits per second",
+    ["client_mac", "ap_mac"]
+)
+
+client_traffic_down = Gauge(
+    "omada_client_traffic_down_bytes",
+    "Client download traffic in bytes",
+    ["client_mac", "ap_mac"]
+)
+
+client_traffic_up = Gauge(
+    "omada_client_traffic_up_bytes",
+    "Client upload traffic in bytes",
+    ["client_mac", "ap_mac"]
+)
+
+client_uptime = Gauge(
+    "omada_client_uptime_seconds",
+    "Client connection uptime in seconds",
+    ["client_mac", "ap_mac"]
+)
+
 # ============================================================
 # CLIENT COUNT API
 # ============================================================
@@ -1044,7 +1129,7 @@ def get_all_clients_via_browser():
 
     all_clients = []
     page = 1
-    page_size = 20
+    page_size = 100
     total_rows = None
     max_pages = 100
 
@@ -1207,30 +1292,117 @@ def get_all_clients():
     return get_all_clients_via_browser()
 
 
-def get_client_counts():
-    """
-    Count current clients per AP using the OpenAPI /clients endpoint.
+def update_client_metrics(clients):
+    """Export detailed metrics for active clients from /clients."""
+    client_up.clear()
+    client_details.clear()
+    client_rssi.clear()
+    client_signal_level.clear()
+    client_snr.clear()
+    client_rx_rate.clear()
+    client_tx_rate.clear()
+    client_traffic_down.clear()
+    client_traffic_up.clear()
+    client_uptime.clear()
 
-    Returns:
-        {normalized_ap_mac: {
-            "clientNum": int,
-            "clientNum2g": int,
-            "clientNum5g": int,
-            "clientNum5g2": int,
-            "clientNum6g": int
-        }}
+    exported = 0
 
-    The /clients response contains apMac/apName/radioId/channel.
-    For the current EAP225/EAP723 setup, channel <= 14 is 2.4 GHz and
-    channel > 14 is counted as 5 GHz. 6 GHz remains zero unless an
-    explicit 6 GHz field is supplied by the API.
-    """
-    clients = get_all_clients()
+    for client in clients:
+        if not isinstance(client, dict) or client.get("active") is False:
+            continue
+
+        client_mac = normalize_mac(client.get("mac"))
+        ap_mac = normalize_mac(client.get("apMac"))
+        if not client_mac or not ap_mac:
+            continue
+
+        client_name = str(client.get("name") or client_mac)
+        ap_name = str(client.get("apName") or ap_mac)
+        ssid = str(client.get("ssid") or "")
+        ip = str(client.get("ip") or "")
+        os_name = str(client.get("osName") or "Unknown")
+        vendor = str(client.get("vendor") or "Unknown")
+
+        try:
+            channel = int(client.get("channel"))
+        except (TypeError, ValueError):
+            channel = 0
+
+        if 1 <= channel <= 14:
+            band = "2.4G"
+        elif channel > 14:
+            band = "5G"
+        else:
+            band = "Unknown"
+
+        identity = {
+            "client_mac": client_mac,
+            "client_name": client_name,
+            "ap_mac": ap_mac,
+            "ap_name": ap_name,
+            "ssid": ssid,
+            "band": band,
+            "channel": str(channel),
+            "os": os_name,
+            "vendor": vendor,
+        }
+        pair = {"client_mac": client_mac, "ap_mac": ap_mac}
+
+        rssi = metric_number(client, "rssi")
+        signal = metric_number(client, "signalLevel")
+        snr = metric_number(client, "snr")
+        rx_rate = metric_number(client, "rxRate") * 1000
+        tx_rate = metric_number(client, "txRate") * 1000
+        download = metric_number(client, "trafficDown")
+        upload = metric_number(client, "trafficUp")
+        uptime = metric_number(client, "uptime")
+
+        client_up.labels(**identity).set(1)
+        client_rssi.labels(**pair).set(rssi)
+        client_signal_level.labels(**pair).set(signal)
+        client_snr.labels(**pair).set(snr)
+
+        # Captured Omada client payload reports rxRate/txRate as Kbps.
+        client_rx_rate.labels(**pair).set(rx_rate)
+        client_tx_rate.labels(**pair).set(tx_rate)
+        client_traffic_down.labels(**pair).set(download)
+        client_traffic_up.labels(**pair).set(upload)
+        client_uptime.labels(**pair).set(uptime)
+
+        client_details.labels(
+            client_mac=client_mac,
+            client_name=client_name,
+            ap_mac=ap_mac,
+            ap_name=ap_name,
+            ssid=ssid,
+            band=band,
+            channel=str(channel),
+            ip=ip,
+            os=os_name,
+            vendor=vendor,
+            rssi=str(rssi),
+            signal=str(signal),
+            snr=str(snr),
+            rx_rate=str(rx_rate),
+            tx_rate=str(tx_rate),
+            download=str(download),
+            upload=str(upload),
+            uptime=str(uptime),
+        ).set(1)
+
+        exported += 1
+
+    print(f"[CLIENT METRICS] Exported active clients: {exported}", flush=True)
+
+
+def get_client_counts(clients=None):
+    """Count current clients per AP from already-fetched /clients data."""
+    if clients is None:
+        clients = get_all_clients()
 
     counts = {}
 
     for client in clients:
-        # Only count active/current clients when the API provides the flag.
         if client.get("active") is False:
             continue
 
@@ -1249,9 +1421,6 @@ def get_client_counts():
 
         counts[ap_mac]["clientNum"] += 1
 
-        # The OpenAPI client records expose channel.
-        # 2.4 GHz channels are 1-14; higher channels are treated as 5 GHz
-        # for this exporter.
         try:
             channel = int(client.get("channel"))
         except (TypeError, ValueError):
@@ -1262,7 +1431,6 @@ def get_client_counts():
         elif channel > 14:
             counts[ap_mac]["clientNum5g"] += 1
 
-    # Ensure every configured AP has a metric, even when it has zero clients.
     for _, configured_mac in DEVICES.items():
         normalized = normalize_mac(configured_mac)
         if normalized and normalized not in counts:
@@ -1275,20 +1443,13 @@ def get_client_counts():
             }
 
     client_api_up.set(1)
-
-    print(
-        f"[CLIENT API] Total clients collected: {len(clients)}",
-        flush=True
-    )
+    print(f"[CLIENT API] Total clients collected: {len(clients)}", flush=True)
 
     for mac, values in counts.items():
         print(
-            f"[CLIENTS] {mac} "
-            f"total={values['clientNum']} "
-            f"2.4GHz={values['clientNum2g']} "
-            f"5GHz={values['clientNum5g']} "
-            f"5GHz-2={values['clientNum5g2']} "
-            f"6GHz={values['clientNum6g']}",
+            f"[CLIENTS] {mac} total={values['clientNum']} "
+            f"2.4GHz={values['clientNum2g']} 5GHz={values['clientNum5g']} "
+            f"5GHz-2={values['clientNum5g2']} 6GHz={values['clientNum6g']}",
             flush=True
         )
 
@@ -1844,9 +2005,12 @@ def update_metrics():
                 print(f"[SSID API ERROR] {repr(e)}", flush=True)
 
             client_counts = {}
+            clients = []
 
             try:
-                client_counts = get_client_counts()
+                clients = get_all_clients()
+                update_client_metrics(clients)
+                client_counts = get_client_counts(clients)
 
             except requests.exceptions.ConnectionError as e:
                 print(
